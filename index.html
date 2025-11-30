@@ -302,6 +302,30 @@
       pointer-events: none;
     }
 
+    #sync-btn {
+      position: absolute;
+      top: 12px;
+      right: 150px;
+      width: 40px;
+      height: 40px;
+      background: white;
+      border: 2px solid #ccc;
+      border-radius: 6px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      cursor: pointer;
+      box-shadow: 0 0 8px rgba(0,0,0,0.3);
+      font-size: 20px;
+      color: #333;
+      z-index: 1002;
+    }
+
+    #sync-btn:hover {
+      background: #f0f8ff;
+      border-color: #4CAF50;
+    }
+
     /* ИСПРАВЛЕННЫЕ СТИЛИ ДЛЯ МОДАЛЬНОГО ОКНА АВТОРИЗАЦИИ */
     #auth-modal {
       display: none;
@@ -325,13 +349,13 @@
       padding: 25px;
       border-radius: 8px;
       box-shadow: 0 0 25px rgba(0,0,0,0.5);
-      z-index: 10001; /* Важно: должен быть выше чем фон */
+      z-index: 10001;
       text-align: center;
       width: 350px;
       max-width: 90vw;
       max-height: 90vh;
       overflow-y: auto;
-      position: relative; /* Добавляем для корректного позиционирования */
+      position: relative;
     }
 
     #auth-email, #auth-password {
@@ -639,7 +663,7 @@
       font-size: 12px;
       font-weight: bold;
       color: #333;
-      background: rgba(255, 255, 200, 0.85); /* Светло-желтая заливка */
+      background: rgba(255, 255, 200, 0.85);
       padding: 2px 4px;
       border-radius: 3px;
       border: 1px solid #ccc;
@@ -916,6 +940,7 @@
 <button id="legend-btn">🛈</button>
 <button id="search-btn">🔍</button>
 <button class="export-btn" id="export-btn" title="Экспорт маршрутов">💾</button>
+<button class="export-btn" id="sync-btn" title="Синхронизировать базу">🔄</button>
 <div id="user-info" style="display: none;">
   <span id="user-email"></span>
   <span id="user-role" class="user-role-badge"></span>
@@ -1085,6 +1110,201 @@
         tooltip.parentNode.removeChild(tooltip);
       }
     }, 2000);
+  }
+
+  // === ФУНКЦИЯ: Синхронизация Firestore с GeoJSON ===
+  async function syncFirestoreWithGeoJson() {
+    const user = auth.currentUser;
+    if (!user || user.isAnonymous) {
+      console.log('Пользователь не авторизован - пропускаем синхронизацию');
+      return;
+    }
+
+    try {
+      console.log('🔄 Начинаем синхронизацию Firestore с GeoJSON...');
+      
+      // Собираем все OBJECTID из GeoJSON
+      const geoJsonObjectIds = new Set();
+      geoJsonData.features.forEach(feature => {
+        const objectId = feature.properties?.OBJECTID;
+        if (objectId) {
+          geoJsonObjectIds.add(objectId.toString());
+        }
+      });
+      
+      console.log(`OBJECTID в GeoJSON: ${geoJsonObjectIds.size} записей`);
+      
+      // Собираем все OBJECTID из Firestore
+      const firestoreObjectIds = new Map(); // objectId -> documentId
+      for (let [docId, data] of firestoreData) {
+        if (data.fb_objectid) {
+          firestoreObjectIds.set(data.fb_objectid.toString(), docId);
+        }
+      }
+      
+      console.log(`OBJECTID в Firestore: ${firestoreObjectIds.size} записей`);
+      
+      let deletedCount = 0;
+      let keptCount = 0;
+      
+      // Находим OBJECTID которые есть в Firestore, но отсутствуют в GeoJSON
+      for (let [objectId, docId] of firestoreObjectIds) {
+        if (!geoJsonObjectIds.has(objectId)) {
+          // Этот OBJECTID есть в Firestore, но отсутствует в GeoJSON - удаляем
+          console.log(`🗑️ Удаление документа: ${docId} (OBJECTID: ${objectId})`);
+          
+          try {
+            await db.collection('items').doc(docId).delete();
+            // Удаляем из локального кэша
+            firestoreData.delete(docId);
+            deletedCount++;
+            
+            console.log(`✅ Удален документ: ${docId}`);
+          } catch (deleteError) {
+            console.error(`❌ Ошибка удаления документа ${docId}:`, deleteError);
+          }
+        } else {
+          keptCount++;
+        }
+      }
+      
+      if (deletedCount > 0) {
+        console.log(`✅ Синхронизация завершена. Удалено записей: ${deletedCount}, сохранено: ${keptCount}`);
+        showSaveNotification(`Удалено ${deletedCount} устаревших записей из базы`);
+      } else {
+        console.log(`✅ Синхронизация завершена. Все записи актуальны. Сохранено: ${keptCount}`);
+      }
+      
+      return { deleted: deletedCount, kept: keptCount };
+      
+    } catch (error) {
+      console.error('❌ Ошибка синхронизации Firestore с GeoJSON:', error);
+      showSaveNotification('Ошибка синхронизации базы данных');
+      return { deleted: 0, kept: 0, error: error.message };
+    }
+  }
+
+  // === ФУНКЦИЯ: Создание отсутствующих записей в Firestore ===
+  async function createMissingFirestoreRecords() {
+    const user = auth.currentUser;
+    if (!user || user.isAnonymous) {
+      console.log('Пользователь не авторизован - пропускаем создание записей');
+      return { created: 0, skipped: 0 };
+    }
+
+    try {
+      let createdCount = 0;
+      let skippedCount = 0;
+      
+      console.log('Проверка отсутствующих записей в Firestore...');
+      
+      for (const feature of geoJsonData.features) {
+        const objectId = feature.properties?.OBJECTID;
+        if (!objectId) {
+          console.log('Пропуск фичи без OBJECTID');
+          skippedCount++;
+          continue;
+        }
+
+        // Проверяем, существует ли уже запись для этого OBJECTID
+        let exists = false;
+        for (let [docId, data] of firestoreData) {
+          if (data.fb_objectid == objectId) {
+            exists = true;
+            break;
+          }
+        }
+
+        // Если записи нет - создаем новую с именем "doc_" + object_id
+        if (!exists) {
+          console.log(`Создание новой записи для OBJECTID: ${objectId}`);
+          
+          // Создаем имя документа в формате "doc_" + object_id
+          const documentId = "doc_" + objectId;
+          const newDocRef = db.collection('items').doc(documentId);
+          
+          const initialData = {
+            fb_objectid: objectId,
+            weight: feature.properties?.weight || 5, // Значение по умолчанию
+            created_at: getMoscowTimestamp(),
+            created_by: currentUserEmail,
+            editor_name: 'system',
+            editor_email: 'system',
+            editor_timestamp: getMoscowTimestamp(),
+            editor_datetime: getMoscowDateTime(),
+            last_modified: new Date().toISOString()
+          };
+
+          await newDocRef.set(initialData);
+          
+          // Добавляем в локальный кэш
+          firestoreData.set(newDocRef.id, initialData);
+          createdCount++;
+          
+          console.log(`✅ Создана новая запись для OBJECTID: ${objectId}, Document ID: ${newDocRef.id}`);
+        } else {
+          skippedCount++;
+        }
+      }
+
+      if (createdCount > 0) {
+        console.log(`✅ Создано новых записей: ${createdCount}, пропущено: ${skippedCount}`);
+        showSaveNotification(`Создано ${createdCount} новых записей в базе`);
+      } else {
+        console.log(`✅ Все записи уже существуют в Firestore. Пропущено: ${skippedCount}`);
+      }
+      
+      return { created: createdCount, skipped: skippedCount };
+      
+    } catch (error) {
+      console.error('❌ Ошибка создания записей в Firestore:', error);
+      showSaveNotification('Ошибка создания записей в базе');
+      return { created: 0, skipped: 0, error: error.message };
+    }
+  }
+
+  // === ФУНКЦИЯ ПОЛНОЙ СИНХРОНИЗАЦИИ ===
+  async function performFullSync() {
+    const user = auth.currentUser;
+    if (!user || user.isAnonymous) {
+      console.log('Пользователь не авторизован - пропускаем синхронизацию');
+      return;
+    }
+
+    showLoadingModal();
+    
+    try {
+      console.log('🔄 Запуск полной синхронизации...');
+      
+      // 1. Сначала удаляем устаревшие записи
+      const deletionStats = await syncFirestoreWithGeoJson();
+      
+      // 2. Затем создаем отсутствующие записи
+      const creationStats = await createMissingFirestoreRecords();
+      
+      // 3. Перезагружаем данные Firestore
+      await loadFirestoreData();
+      
+      console.log('✅ Полная синхронизация завершена:', {
+        удалено: deletionStats.deleted,
+        создано: creationStats.created,
+        всего_в_базе: firestoreData.size
+      });
+      
+      showSaveNotification(`Синхронизация завершена: удалено ${deletionStats.deleted}, создано ${creationStats.created}`);
+      
+      return {
+        deletion: deletionStats,
+        creation: creationStats,
+        totalInFirestore: firestoreData.size
+      };
+      
+    } catch (error) {
+      console.error('❌ Ошибка полной синхронизации:', error);
+      showSaveNotification('Ошибка синхронизации базы данных');
+    } finally {
+      hideLoadingModal();
+    }
   }
 
   // === Обновленная функция экспорта ===
@@ -1549,6 +1769,16 @@
         firestoreData.set(doc.id, doc.data());
       });
       console.log('Загружено записей из Firestore:', firestoreData.size);
+      
+      // Логируем несколько примеров для отладки
+      let count = 0;
+      for (let [docId, data] of firestoreData) {
+        if (count < 5) {
+          console.log(`Документ: ${docId}, OBJECTID: ${data.fb_objectid}`);
+          count++;
+        }
+      }
+      
       return true;
     } catch (error) {
       console.error('Ошибка загрузки из Firestore:', error);
@@ -1556,7 +1786,7 @@
     }
   }
 
-  async function updateWeightInFirestore(documentId, newWeight) {
+  async function updateWeightInFirestore(objectId, newWeight) {
     const user = auth.currentUser;
     
     if (!user || user.isAnonymous) {
@@ -1567,7 +1797,7 @@
     // Принудительно обновляем токен аутентификации
     try {
       console.log('🔄 Принудительное обновление ID token...');
-      await user.getIdToken(true); // true = force refresh
+      await user.getIdToken(true);
       console.log('✅ ID token обновлен');
     } catch (error) {
       console.error('Ошибка обновления токена:', error);
@@ -1593,7 +1823,14 @@
       const moscowTimestamp = getMoscowTimestamp();
       const moscowDateTime = getMoscowDateTime();
       
-      console.log('Попытка записи в Firestore...');
+      // Используем documentId в формате "doc_" + object_id
+      const documentId = "doc_" + objectId;
+      
+      console.log('Попытка записи в Firestore...', {
+        documentId: documentId,
+        objectId: objectId,
+        newWeight: newWeight
+      });
       
       await db.collection('items').doc(documentId).update({
         weight: newWeight,
@@ -1623,6 +1860,36 @@
       
       if (error.code === 'permission-denied') {
         alert('Ошибка доступа: Недостаточно прав. Токен не обновил статус подтверждения email. Попробуйте выйти и зайти снова.');
+      } else if (error.code === 'not-found') {
+        // Если документ не найден, пробуем создать его
+        console.log('Документ не найден, пробуем создать...');
+        try {
+          const documentId = "doc_" + objectId;
+          const newDocRef = db.collection('items').doc(documentId);
+          const initialData = {
+            fb_objectid: objectId,
+            weight: newWeight,
+            created_at: getMoscowTimestamp(),
+            created_by: currentUserEmail,
+            editor_name: editorName,
+            editor_email: currentUserEmail,
+            editor_timestamp: moscowTimestamp,
+            editor_datetime: moscowDateTime,
+            last_modified: new Date().toISOString(),
+            editor_verified: true
+          };
+
+          await newDocRef.set(initialData);
+          firestoreData.set(documentId, initialData);
+          
+          console.log('✅ Создан новый документ:', documentId);
+          showSaveNotification();
+          return true;
+        } catch (createError) {
+          console.error('Ошибка создания документа:', createError);
+          alert('Ошибка создания документа: ' + createError.message);
+          return false;
+        }
       } else {
         alert('Ошибка сохранения: ' + error.message);
       }
@@ -1630,7 +1897,7 @@
     }
   }
 
-  async function updateCommentInFirestore(documentId, newComment) {
+  async function updateCommentInFirestore(objectId, newComment) {
     const user = auth.currentUser;
     
     if (!user || user.isAnonymous) {
@@ -1661,6 +1928,9 @@
       
       const moscowTimestamp = getMoscowTimestamp();
       const moscowDateTime = getMoscowDateTime();
+      
+      // Используем documentId в формате "doc_" + object_id
+      const documentId = "doc_" + objectId;
       
       await db.collection('items').doc(documentId).update({
         comment: newComment,
@@ -1828,8 +2098,8 @@
           e.stopPropagation();
           const newWeight = parseInt(item.dataset.weight, 10);
           
-          if (documentId) {
-            const success = await updateWeightInFirestore(documentId, newWeight);
+          if (objectId) {
+            const success = await updateWeightInFirestore(objectId, newWeight);
             if (success) {
               console.log('Weight updated successfully');
               updateFeatureStyle(feature, newWeight);
@@ -1838,7 +2108,7 @@
               // Ошибка уже обработана в updateWeightInFirestore
             }
           } else {
-            alert('Ошибка: не найден соответствующий документ в базе');
+            alert('Ошибка: не найден OBJECTID');
           }
         });
       });
@@ -1858,8 +2128,8 @@
         e.stopPropagation();
         const newComment = commentInput.value.trim();
         
-        if (documentId) {
-          const success = await updateCommentInFirestore(documentId, newComment);
+        if (objectId) {
+          const success = await updateCommentInFirestore(objectId, newComment);
           if (success) {
             console.log('Comment updated successfully');
             showSaveNotification('Комментарий сохранен!');
@@ -1886,7 +2156,7 @@
             // Ошибка уже обработана в updateCommentInFirestore
           }
         } else {
-          alert('Ошибка: не найден соответствующий документ в базе');
+          alert('Ошибка: не найден OBJECTID');
         }
       });
     }
@@ -1924,6 +2194,7 @@
     }
   }
 
+  // === ОБНОВЛЕННАЯ ФУНКЦИЯ ИНИЦИАЛИЗАЦИИ КАРТЫ ===
   async function initializeMap() {
     showLoadingModal();
     
@@ -1936,6 +2207,14 @@
         alert('Ошибка загрузки данных из базы. Проверьте подключение.');
         hideLoadingModal();
         return;
+      }
+
+      // === ВАЖНОЕ ИЗМЕНЕНИЕ: Полная синхронизация ===
+      if (canUserEdit()) {
+        console.log('Запуск полной синхронизации Firestore с GeoJSON...');
+        await performFullSync();
+      } else {
+        console.log('Пользователь не может редактировать - пропускаем синхронизацию');
       }
 
       const mergedFeatures = geoJsonData.features.map(feature => {
@@ -2424,7 +2703,6 @@
     document.getElementById('auth-modal').addEventListener('click', (e) => {
       if (e.target.id === 'auth-modal') {
         // Не закрываем окно авторизации при клике вне его, чтобы пользователь не мог его пропустить
-        // Можно добавить подтверждение, если нужно
       }
     });
 
@@ -2488,6 +2766,19 @@
 
     document.getElementById('export-btn').addEventListener('click', () => {
       saveRoutesToFile();
+    });
+
+    // Обработчик для кнопки синхронизации
+    document.getElementById('sync-btn').addEventListener('click', async () => {
+      if (!canUserEdit()) {
+        alert('Для синхронизации необходимо войти в систему с подтвержденным email');
+        return;
+      }
+      
+      const result = await performFullSync();
+      if (result) {
+        console.log('Ручная синхронизация завершена:', result);
+      }
     });
   });
 
@@ -2562,6 +2853,3 @@
 </script>
 </body>
 </html>
-
-
-
